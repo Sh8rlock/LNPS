@@ -1,0 +1,1448 @@
+#!/bin/bash
+# LNPS Setup Script - Linux Network Packet Sniffer
+# Author: Larry Odeyemi
+# Run: bash setup_lnps.txt
+
+echo "[*] Setting up LNPS - Linux Network Packet Sniffer..."
+
+echo "[*] Creating protocol_parser.py..."
+cat > protocol_parser.py << 'LNPS_EOF_PROTOCOL_PARSER_PY'
+"""
+LNPS - Protocol Parser
+Parses raw packet bytes into structured protocol data.
+Supports: Ethernet, IPv4, TCP, UDP, ICMP, ARP, DNS
+"""
+
+import struct
+import socket
+
+
+def parse_ethernet(raw_data):
+    """Parse Ethernet frame header (14 bytes)."""
+    dest_mac, src_mac, proto = struct.unpack('! 6s 6s H', raw_data[:14])
+    return {
+        'dest_mac': format_mac(dest_mac),
+        'src_mac': format_mac(src_mac),
+        'protocol': proto,
+        'protocol_name': get_eth_protocol_name(proto),
+        'payload': raw_data[14:]
+    }
+
+
+def parse_ipv4(raw_data):
+    """Parse IPv4 header (20+ bytes)."""
+    version_ihl = raw_data[0]
+    version = version_ihl >> 4
+    ihl = (version_ihl & 0xF) * 4
+    ttl, proto, checksum, src_ip, dest_ip = struct.unpack('! 8x B B H 4s 4s', raw_data[:20])
+    total_length = struct.unpack('!H', raw_data[2:4])[0]
+
+    flags_fragment = struct.unpack('!H', raw_data[6:8])[0]
+    flags = (flags_fragment >> 13) & 0x7
+    fragment_offset = flags_fragment & 0x1FFF
+
+    return {
+        'version': version,
+        'header_length': ihl,
+        'ttl': ttl,
+        'protocol': proto,
+        'protocol_name': get_ip_protocol_name(proto),
+        'checksum': checksum,
+        'src_ip': socket.inet_ntoa(src_ip),
+        'dest_ip': socket.inet_ntoa(dest_ip),
+        'total_length': total_length,
+        'flags': flags,
+        'fragment_offset': fragment_offset,
+        'payload': raw_data[ihl:]
+    }
+
+
+def parse_tcp(raw_data):
+    """Parse TCP header (20+ bytes)."""
+    src_port, dest_port, seq, ack, offset_flags = struct.unpack('! H H L L H', raw_data[:14])
+    offset = (offset_flags >> 12) * 4
+    flags = {
+        'FIN': bool(offset_flags & 0x01),
+        'SYN': bool(offset_flags & 0x02),
+        'RST': bool(offset_flags & 0x04),
+        'PSH': bool(offset_flags & 0x08),
+        'ACK': bool(offset_flags & 0x10),
+        'URG': bool(offset_flags & 0x20),
+    }
+    window_size = struct.unpack('!H', raw_data[14:16])[0]
+
+    return {
+        'src_port': src_port,
+        'dest_port': dest_port,
+        'sequence': seq,
+        'acknowledgment': ack,
+        'header_length': offset,
+        'flags': flags,
+        'flag_str': get_tcp_flag_str(flags),
+        'window_size': window_size,
+        'service': identify_service(src_port, dest_port),
+        'payload': raw_data[offset:]
+    }
+
+
+def parse_udp(raw_data):
+    """Parse UDP header (8 bytes)."""
+    src_port, dest_port, length, checksum = struct.unpack('! H H H H', raw_data[:8])
+    return {
+        'src_port': src_port,
+        'dest_port': dest_port,
+        'length': length,
+        'checksum': checksum,
+        'service': identify_service(src_port, dest_port),
+        'payload': raw_data[8:]
+    }
+
+
+def parse_icmp(raw_data):
+    """Parse ICMP header (8 bytes)."""
+    icmp_type, code, checksum = struct.unpack('! B B H', raw_data[:4])
+    return {
+        'type': icmp_type,
+        'code': code,
+        'checksum': checksum,
+        'type_name': get_icmp_type_name(icmp_type),
+        'payload': raw_data[4:]
+    }
+
+
+def parse_arp(raw_data):
+    """Parse ARP header (28 bytes)."""
+    hw_type, proto_type, hw_size, proto_size, opcode = struct.unpack('! H H B B H', raw_data[:8])
+    sender_mac = raw_data[8:14]
+    sender_ip = raw_data[14:18]
+    target_mac = raw_data[18:24]
+    target_ip = raw_data[24:28]
+
+    return {
+        'hw_type': hw_type,
+        'protocol_type': proto_type,
+        'opcode': opcode,
+        'opcode_name': 'REQUEST' if opcode == 1 else 'REPLY' if opcode == 2 else f'UNKNOWN({opcode})',
+        'sender_mac': format_mac(sender_mac),
+        'sender_ip': socket.inet_ntoa(sender_ip),
+        'target_mac': format_mac(target_mac),
+        'target_ip': socket.inet_ntoa(target_ip)
+    }
+
+
+def parse_dns(raw_data):
+    """Parse DNS header (basic)."""
+    if len(raw_data) < 12:
+        return None
+    txn_id, flags, q_count, a_count, auth_count, add_count = struct.unpack('!H H H H H H', raw_data[:12])
+    qr = (flags >> 15) & 1
+    opcode = (flags >> 11) & 0xF
+    rcode = flags & 0xF
+
+    return {
+        'transaction_id': txn_id,
+        'qr': 'RESPONSE' if qr else 'QUERY',
+        'opcode': opcode,
+        'rcode': rcode,
+        'questions': q_count,
+        'answers': a_count,
+        'authority': auth_count,
+        'additional': add_count
+    }
+
+
+# === Helper Functions ===
+
+def format_mac(mac_bytes):
+    """Format MAC address bytes to colon-separated hex string."""
+    return ':'.join(f'{b:02x}' for b in mac_bytes)
+
+
+def get_eth_protocol_name(proto):
+    """Map Ethernet protocol number to name."""
+    protocols = {
+        0x0800: 'IPv4',
+        0x0806: 'ARP',
+        0x86DD: 'IPv6',
+        0x8100: 'VLAN',
+    }
+    return protocols.get(proto, f'Unknown(0x{proto:04x})')
+
+
+def get_ip_protocol_name(proto):
+    """Map IP protocol number to name."""
+    protocols = {
+        1: 'ICMP',
+        6: 'TCP',
+        17: 'UDP',
+        47: 'GRE',
+        50: 'ESP',
+        51: 'AH',
+    }
+    return protocols.get(proto, f'Unknown({proto})')
+
+
+def get_tcp_flag_str(flags):
+    """Return compact flag string like [SYN,ACK]."""
+    active = [name for name, val in flags.items() if val]
+    return f"[{','.join(active)}]" if active else "[]"
+
+
+def get_icmp_type_name(icmp_type):
+    """Map ICMP type to name."""
+    types = {
+        0: 'Echo Reply',
+        3: 'Destination Unreachable',
+        5: 'Redirect',
+        8: 'Echo Request',
+        11: 'Time Exceeded',
+    }
+    return types.get(icmp_type, f'Type({icmp_type})')
+
+
+def identify_service(src_port, dest_port):
+    """Identify well-known service from port numbers."""
+    services = {
+        20: 'FTP-Data', 21: 'FTP', 22: 'SSH', 23: 'Telnet',
+        25: 'SMTP', 53: 'DNS', 67: 'DHCP-Server', 68: 'DHCP-Client',
+        80: 'HTTP', 110: 'POP3', 143: 'IMAP', 443: 'HTTPS',
+        445: 'SMB', 993: 'IMAPS', 995: 'POP3S', 3306: 'MySQL',
+        3389: 'RDP', 5432: 'PostgreSQL', 5900: 'VNC', 6379: 'Redis',
+        8080: 'HTTP-Proxy', 8443: 'HTTPS-Alt', 27017: 'MongoDB',
+    }
+    for port in [dest_port, src_port]:
+        if port in services:
+            return services[port]
+    return None
+
+LNPS_EOF_PROTOCOL_PARSER_PY
+
+echo "[*] Creating packet_sniffer.py..."
+cat > packet_sniffer.py << 'LNPS_EOF_PACKET_SNIFFER_PY'
+"""
+LNPS - Packet Sniffer Engine
+Captures packets using raw sockets (live mode) or processes simulated traffic (demo mode).
+Requires root/sudo for live capture.
+"""
+
+import time
+import struct
+import socket
+from protocol_parser import (
+    parse_ethernet, parse_ipv4, parse_tcp, parse_udp,
+    parse_icmp, parse_arp, parse_dns
+)
+
+
+class PacketSniffer:
+    """Core packet capture and processing engine."""
+
+    def __init__(self, interface=None, max_packets=0, bpf_filter=None):
+        self.interface = interface
+        self.max_packets = max_packets
+        self.bpf_filter = bpf_filter
+        self.packets = []
+        self.stats = {
+            'total': 0,
+            'tcp': 0,
+            'udp': 0,
+            'icmp': 0,
+            'arp': 0,
+            'dns': 0,
+            'other': 0,
+            'bytes_captured': 0,
+            'start_time': None,
+            'end_time': None,
+        }
+
+    def start_live_capture(self):
+        """Start live packet capture using raw sockets (requires root)."""
+        try:
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3))
+        except PermissionError:
+            print("[!] ERROR: Live capture requires root privileges.")
+            print("[*] Run with: sudo python3 run_sniffer.py --live")
+            print("[*] Or use demo mode: python3 run_sniffer.py --demo")
+            return []
+        except OSError as e:
+            print(f"[!] ERROR: {e}")
+            print("[*] Raw sockets require Linux. Use --demo on other platforms.")
+            return []
+
+        if self.interface:
+            sock.bind((self.interface, 0))
+
+        self.stats['start_time'] = time.time()
+        count = 0
+
+        print(f"[*] Sniffing on {'all interfaces' if not self.interface else self.interface}...")
+        print(f"[*] Max packets: {'unlimited' if self.max_packets == 0 else self.max_packets}")
+        print("[*] Press Ctrl+C to stop\n")
+
+        try:
+            while True:
+                raw_data, addr = sock.recvfrom(65535)
+                packet = self._process_packet(raw_data, time.time())
+                if packet:
+                    self.packets.append(packet)
+                    self._print_packet_summary(packet)
+                    count += 1
+
+                if self.max_packets > 0 and count >= self.max_packets:
+                    break
+
+        except KeyboardInterrupt:
+            print(f"\n[*] Capture stopped. {count} packets captured.")
+
+        finally:
+            sock.close()
+            self.stats['end_time'] = time.time()
+
+        return self.packets
+
+    def process_demo_traffic(self, demo_packets):
+        """Process pre-generated demo traffic for testing."""
+        self.stats['start_time'] = time.time()
+
+        for raw_data in demo_packets:
+            packet = self._process_packet(raw_data, time.time())
+            if packet:
+                self.packets.append(packet)
+
+        self.stats['end_time'] = time.time()
+        return self.packets
+
+    def _process_packet(self, raw_data, timestamp):
+        """Parse raw bytes into structured packet dictionary."""
+        if len(raw_data) < 14:
+            return None
+
+        self.stats['total'] += 1
+        self.stats['bytes_captured'] += len(raw_data)
+
+        packet = {
+            'timestamp': timestamp,
+            'raw_length': len(raw_data),
+            'layers': {},
+            'summary': ''
+        }
+
+        # Layer 2 - Ethernet
+        eth = parse_ethernet(raw_data)
+        packet['layers']['ethernet'] = eth
+
+        # ARP
+        if eth['protocol'] == 0x0806:
+            if len(eth['payload']) >= 28:
+                arp = parse_arp(eth['payload'])
+                packet['layers']['arp'] = arp
+                packet['summary'] = (
+                    f"ARP {arp['opcode_name']}: "
+                    f"{arp['sender_ip']} ({arp['sender_mac']}) -> "
+                    f"{arp['target_ip']} ({arp['target_mac']})"
+                )
+                self.stats['arp'] += 1
+                return packet
+
+        # IPv4
+        if eth['protocol'] == 0x0800:
+            if len(eth['payload']) < 20:
+                return packet
+            ip = parse_ipv4(eth['payload'])
+            packet['layers']['ipv4'] = ip
+
+            # TCP
+            if ip['protocol'] == 6 and len(ip['payload']) >= 20:
+                tcp = parse_tcp(ip['payload'])
+                packet['layers']['tcp'] = tcp
+                self.stats['tcp'] += 1
+
+                # DNS over TCP
+                if tcp['src_port'] == 53 or tcp['dest_port'] == 53:
+                    if len(tcp['payload']) >= 12:
+                        dns = parse_dns(tcp['payload'])
+                        if dns:
+                            packet['layers']['dns'] = dns
+                            self.stats['dns'] += 1
+
+                service_tag = f" ({tcp['service']})" if tcp['service'] else ''
+                packet['summary'] = (
+                    f"TCP {ip['src_ip']}:{tcp['src_port']} -> "
+                    f"{ip['dest_ip']}:{tcp['dest_port']} "
+                    f"{tcp['flag_str']}{service_tag}"
+                )
+
+            # UDP
+            elif ip['protocol'] == 17 and len(ip['payload']) >= 8:
+                udp = parse_udp(ip['payload'])
+                packet['layers']['udp'] = udp
+                self.stats['udp'] += 1
+
+                # DNS over UDP
+                if udp['src_port'] == 53 or udp['dest_port'] == 53:
+                    if len(udp['payload']) >= 12:
+                        dns = parse_dns(udp['payload'])
+                        if dns:
+                            packet['layers']['dns'] = dns
+                            self.stats['dns'] += 1
+
+                service_tag = f" ({udp['service']})" if udp['service'] else ''
+                packet['summary'] = (
+                    f"UDP {ip['src_ip']}:{udp['src_port']} -> "
+                    f"{ip['dest_ip']}:{udp['dest_port']}{service_tag}"
+                )
+
+            # ICMP
+            elif ip['protocol'] == 1 and len(ip['payload']) >= 4:
+                icmp = parse_icmp(ip['payload'])
+                packet['layers']['icmp'] = icmp
+                self.stats['icmp'] += 1
+                packet['summary'] = (
+                    f"ICMP {ip['src_ip']} -> {ip['dest_ip']} "
+                    f"{icmp['type_name']}"
+                )
+
+            else:
+                self.stats['other'] += 1
+                packet['summary'] = (
+                    f"{ip['protocol_name']} {ip['src_ip']} -> {ip['dest_ip']}"
+                )
+
+        return packet
+
+    def _print_packet_summary(self, packet):
+        """Print one-line packet summary to console."""
+        ts = time.strftime('%H:%M:%S', time.localtime(packet['timestamp']))
+        print(f"  [{ts}] {packet['summary']}")
+
+    def get_stats(self):
+        """Return capture statistics."""
+        duration = 0
+        if self.stats['start_time'] and self.stats['end_time']:
+            duration = self.stats['end_time'] - self.stats['start_time']
+        self.stats['duration'] = round(duration, 2)
+        self.stats['pps'] = round(self.stats['total'] / max(duration, 0.01), 1)
+        return self.stats
+
+LNPS_EOF_PACKET_SNIFFER_PY
+
+echo "[*] Creating alert_engine.py..."
+cat > alert_engine.py << 'LNPS_EOF_ALERT_ENGINE_PY'
+"""
+LNPS - Security Alert Engine
+Detects suspicious network activity patterns from parsed packets.
+Categories: Port Scan, Brute Force, DNS Tunneling, ARP Spoofing,
+            Cleartext Credentials, Suspicious Ports, ICMP Flood,
+            Data Exfiltration, Insecure Services
+"""
+
+from collections import defaultdict
+import time
+
+
+class AlertEngine:
+    """Analyzes captured packets for security threats."""
+
+    SEVERITY_SCORES = {
+        'CRITICAL': 100,
+        'HIGH': 75,
+        'MEDIUM': 50,
+        'LOW': 25,
+        'INFO': 10,
+    }
+
+    SUSPICIOUS_PORTS = {
+        4444: ('Metasploit Default', 'CRITICAL'),
+        5555: ('Common Backdoor', 'HIGH'),
+        1234: ('Common Backdoor', 'HIGH'),
+        31337: ('Back Orifice / Elite', 'CRITICAL'),
+        6667: ('IRC (C2 Channel)', 'HIGH'),
+        6697: ('IRC SSL (C2 Channel)', 'HIGH'),
+        9001: ('Tor Default', 'MEDIUM'),
+        9050: ('Tor SOCKS', 'MEDIUM'),
+        1080: ('SOCKS Proxy', 'MEDIUM'),
+        3128: ('Squid Proxy', 'MEDIUM'),
+        8888: ('Common Backdoor', 'HIGH'),
+    }
+
+    INSECURE_SERVICES = {
+        21: ('FTP', 'Cleartext file transfer'),
+        23: ('Telnet', 'Cleartext remote access'),
+        25: ('SMTP', 'Unencrypted email relay'),
+        80: ('HTTP', 'Unencrypted web traffic'),
+        110: ('POP3', 'Cleartext email retrieval'),
+        143: ('IMAP', 'Cleartext email access'),
+        161: ('SNMP', 'Community string exposure'),
+        445: ('SMB', 'Lateral movement vector'),
+        3306: ('MySQL', 'Database exposed'),
+        5432: ('PostgreSQL', 'Database exposed'),
+        6379: ('Redis', 'Unauthenticated by default'),
+        27017: ('MongoDB', 'Unauthenticated by default'),
+        5900: ('VNC', 'Remote desktop exposure'),
+    }
+
+    def __init__(self, thresholds=None):
+        self.alerts = []
+        self.seen_alerts = set()
+        self.thresholds = thresholds or {
+            'port_scan_threshold': 10,
+            'brute_force_threshold': 5,
+            'icmp_flood_threshold': 20,
+            'dns_query_threshold': 15,
+            'large_transfer_bytes': 1048576,  # 1 MB
+        }
+        # Tracking state
+        self.syn_tracker = defaultdict(set)        # src_ip -> set of dest_ports
+        self.auth_tracker = defaultdict(int)        # src_ip -> count of auth attempts
+        self.dns_tracker = defaultdict(int)         # src_ip -> dns query count
+        self.icmp_tracker = defaultdict(int)        # src_ip -> icmp count
+        self.arp_table = {}                         # ip -> mac (for ARP spoof detection)
+        self.transfer_tracker = defaultdict(int)    # src_ip -> bytes sent
+        self.insecure_seen = set()                  # (src_ip, port) dedup
+
+    def analyze(self, packets):
+        """Run all detection rules against captured packets."""
+        for pkt in packets:
+            layers = pkt.get('layers', {})
+
+            # ARP analysis
+            if 'arp' in layers:
+                self._check_arp_spoof(layers['arp'], pkt['timestamp'])
+
+            ipv4 = layers.get('ipv4', {})
+            src_ip = ipv4.get('src_ip', '')
+            dest_ip = ipv4.get('dest_ip', '')
+
+            # TCP analysis
+            if 'tcp' in layers:
+                tcp = layers['tcp']
+                self._check_port_scan(src_ip, dest_ip, tcp, pkt['timestamp'])
+                self._check_brute_force(src_ip, dest_ip, tcp, pkt['timestamp'])
+                self._check_suspicious_port(src_ip, dest_ip, tcp['src_port'], tcp['dest_port'], pkt['timestamp'])
+                self._check_insecure_service(src_ip, dest_ip, tcp['dest_port'], pkt['timestamp'])
+                self._check_data_exfil(src_ip, tcp.get('payload', b''), pkt['timestamp'])
+
+            # UDP analysis
+            if 'udp' in layers:
+                udp = layers['udp']
+                self._check_suspicious_port(src_ip, dest_ip, udp['src_port'], udp['dest_port'], pkt['timestamp'])
+                self._check_insecure_service(src_ip, dest_ip, udp['dest_port'], pkt['timestamp'])
+
+            # DNS analysis
+            if 'dns' in layers:
+                self._check_dns_tunneling(src_ip, pkt['timestamp'])
+
+            # ICMP analysis
+            if 'icmp' in layers:
+                self._check_icmp_flood(src_ip, dest_ip, pkt['timestamp'])
+
+        return self.alerts
+
+    def _add_alert(self, alert_key, category, severity, title, description, src_ip, dest_ip=None, mitre_id=None, mitre_name=None, timestamp=None):
+        """Add alert if not already seen (deduplication)."""
+        if alert_key in self.seen_alerts:
+            return
+        self.seen_alerts.add(alert_key)
+
+        alert = {
+            'id': len(self.alerts) + 1,
+            'category': category,
+            'severity': severity,
+            'score': self.SEVERITY_SCORES.get(severity, 0),
+            'title': title,
+            'description': description,
+            'src_ip': src_ip,
+            'dest_ip': dest_ip or 'N/A',
+            'mitre_technique': mitre_id,
+            'mitre_name': mitre_name,
+            'timestamp': timestamp or time.time(),
+        }
+        self.alerts.append(alert)
+
+    def _check_port_scan(self, src_ip, dest_ip, tcp, timestamp):
+        """Detect port scanning: single source hitting many destination ports."""
+        if tcp['flags'].get('SYN') and not tcp['flags'].get('ACK'):
+            self.syn_tracker[src_ip].add(tcp['dest_port'])
+            count = len(self.syn_tracker[src_ip])
+            if count >= self.thresholds['port_scan_threshold']:
+                self._add_alert(
+                    f"portscan_{src_ip}",
+                    'Port Scan',
+                    'HIGH',
+                    f'Port Scan Detected from {src_ip}',
+                    f'{src_ip} sent SYN packets to {count} unique ports. '
+                    f'Ports targeted: {sorted(list(self.syn_tracker[src_ip]))[:20]}',
+                    src_ip, dest_ip,
+                    'T1046', 'Network Service Discovery',
+                    timestamp
+                )
+
+    def _check_brute_force(self, src_ip, dest_ip, tcp, timestamp):
+        """Detect brute force: repeated connections to auth ports (22, 3389, 21)."""
+        auth_ports = {22, 3389, 21, 23, 5900}
+        if tcp['dest_port'] in auth_ports and tcp['flags'].get('SYN') and not tcp['flags'].get('ACK'):
+            self.auth_tracker[f"{src_ip}:{tcp['dest_port']}"] += 1
+            count = self.auth_tracker[f"{src_ip}:{tcp['dest_port']}"]
+            if count >= self.thresholds['brute_force_threshold']:
+                service_names = {22: 'SSH', 3389: 'RDP', 21: 'FTP', 23: 'Telnet', 5900: 'VNC'}
+                svc = service_names.get(tcp['dest_port'], str(tcp['dest_port']))
+                self._add_alert(
+                    f"bruteforce_{src_ip}_{tcp['dest_port']}",
+                    'Brute Force',
+                    'CRITICAL',
+                    f'Brute Force Attack on {svc} from {src_ip}',
+                    f'{src_ip} made {count} connection attempts to {dest_ip}:{tcp["dest_port"]} ({svc}). '
+                    f'Possible credential stuffing or brute force attack.',
+                    src_ip, dest_ip,
+                    'T1110', 'Brute Force',
+                    timestamp
+                )
+
+    def _check_suspicious_port(self, src_ip, dest_ip, src_port, dest_port, timestamp):
+        """Detect traffic on known malicious ports."""
+        for port in [src_port, dest_port]:
+            if port in self.SUSPICIOUS_PORTS:
+                name, severity = self.SUSPICIOUS_PORTS[port]
+                self._add_alert(
+                    f"suspport_{src_ip}_{port}",
+                    'Suspicious Port',
+                    severity,
+                    f'Traffic on Suspicious Port {port} ({name})',
+                    f'Communication detected between {src_ip} and {dest_ip} on port {port} ({name}). '
+                    f'This port is commonly associated with malicious tools or C2 frameworks.',
+                    src_ip, dest_ip,
+                    'T1571', 'Non-Standard Port',
+                    timestamp
+                )
+
+    def _check_insecure_service(self, src_ip, dest_ip, dest_port, timestamp):
+        """Flag traffic to known insecure/cleartext services."""
+        key = (src_ip, dest_port)
+        if dest_port in self.INSECURE_SERVICES and key not in self.insecure_seen:
+            self.insecure_seen.add(key)
+            name, risk = self.INSECURE_SERVICES[dest_port]
+            self._add_alert(
+                f"insecure_{src_ip}_{dest_port}",
+                'Insecure Service',
+                'MEDIUM',
+                f'Insecure Service Detected: {name} (port {dest_port})',
+                f'{src_ip} connected to {dest_ip}:{dest_port} ({name}). Risk: {risk}. '
+                f'Consider using encrypted alternatives.',
+                src_ip, dest_ip,
+                'T1040', 'Network Sniffing',
+                timestamp
+            )
+
+    def _check_arp_spoof(self, arp, timestamp):
+        """Detect ARP spoofing: IP mapped to multiple MACs."""
+        ip = arp['sender_ip']
+        mac = arp['sender_mac']
+
+        if ip in self.arp_table and self.arp_table[ip] != mac:
+            self._add_alert(
+                f"arpspoof_{ip}",
+                'ARP Spoofing',
+                'CRITICAL',
+                f'ARP Spoofing Detected for {ip}',
+                f'IP {ip} was previously mapped to MAC {self.arp_table[ip]} '
+                f'but is now claiming MAC {mac}. Possible ARP cache poisoning.',
+                ip, None,
+                'T1557.002', 'ARP Cache Poisoning',
+                timestamp
+            )
+        self.arp_table[ip] = mac
+
+    def _check_dns_tunneling(self, src_ip, timestamp):
+        """Detect potential DNS tunneling: excessive DNS queries from one host."""
+        self.dns_tracker[src_ip] += 1
+        if self.dns_tracker[src_ip] >= self.thresholds['dns_query_threshold']:
+            self._add_alert(
+                f"dnstunnel_{src_ip}",
+                'DNS Tunneling',
+                'HIGH',
+                f'Potential DNS Tunneling from {src_ip}',
+                f'{src_ip} made {self.dns_tracker[src_ip]} DNS queries. '
+                f'Excessive DNS traffic may indicate DNS tunneling for data exfiltration or C2.',
+                src_ip, None,
+                'T1071.004', 'DNS',
+                timestamp
+            )
+
+    def _check_icmp_flood(self, src_ip, dest_ip, timestamp):
+        """Detect ICMP flood: excessive pings from single source."""
+        self.icmp_tracker[src_ip] += 1
+        if self.icmp_tracker[src_ip] >= self.thresholds['icmp_flood_threshold']:
+            self._add_alert(
+                f"icmpflood_{src_ip}",
+                'ICMP Flood',
+                'HIGH',
+                f'ICMP Flood Detected from {src_ip}',
+                f'{src_ip} sent {self.icmp_tracker[src_ip]} ICMP packets. '
+                f'Possible ping flood / DoS attack or network reconnaissance.',
+                src_ip, dest_ip,
+                'T1498', 'Network Denial of Service',
+                timestamp
+            )
+
+    def _check_data_exfil(self, src_ip, payload, timestamp):
+        """Detect potential data exfiltration: large outbound transfers."""
+        if isinstance(payload, bytes):
+            self.transfer_tracker[src_ip] += len(payload)
+        if self.transfer_tracker[src_ip] >= self.thresholds['large_transfer_bytes']:
+            mb = round(self.transfer_tracker[src_ip] / (1024 * 1024), 2)
+            self._add_alert(
+                f"exfil_{src_ip}",
+                'Data Exfiltration',
+                'HIGH',
+                f'Large Data Transfer from {src_ip}',
+                f'{src_ip} has transferred {mb} MB of data. '
+                f'Possible data exfiltration or unauthorized file transfer.',
+                src_ip, None,
+                'T1048', 'Exfiltration Over Alternative Protocol',
+                timestamp
+            )
+
+    def get_summary(self):
+        """Return alert summary statistics."""
+        severity_counts = defaultdict(int)
+        category_counts = defaultdict(int)
+        mitre_techniques = set()
+
+        for alert in self.alerts:
+            severity_counts[alert['severity']] += 1
+            category_counts[alert['category']] += 1
+            if alert['mitre_technique']:
+                mitre_techniques.add((alert['mitre_technique'], alert['mitre_name']))
+
+        total_risk = sum(a['score'] for a in self.alerts)
+
+        return {
+            'total_alerts': len(self.alerts),
+            'severity_counts': dict(severity_counts),
+            'category_counts': dict(category_counts),
+            'mitre_techniques': sorted(list(mitre_techniques)),
+            'total_risk_score': total_risk,
+        }
+
+LNPS_EOF_ALERT_ENGINE_PY
+
+echo "[*] Creating demo_traffic.py..."
+cat > demo_traffic.py << 'LNPS_EOF_DEMO_TRAFFIC_PY'
+"""
+LNPS - Demo Traffic Generator
+Generates realistic simulated network packets for testing without root/live capture.
+Includes: Normal traffic, port scans, brute force, ARP spoofing, DNS tunneling,
+           ICMP flood, suspicious ports, insecure services, data exfiltration.
+"""
+
+import struct
+import socket
+import random
+
+
+def build_ethernet(src_mac, dest_mac, proto=0x0800):
+    """Build Ethernet frame header."""
+    return struct.pack('! 6s 6s H',
+                       bytes.fromhex(dest_mac.replace(':', '')),
+                       bytes.fromhex(src_mac.replace(':', '')),
+                       proto)
+
+
+def build_ipv4(src_ip, dest_ip, protocol, payload_len, ttl=64):
+    """Build IPv4 header (no options, 20 bytes)."""
+    version_ihl = (4 << 4) | 5
+    total_length = 20 + payload_len
+    identification = random.randint(1, 65535)
+    flags_fragment = 0x4000  # Don't Fragment
+    header_checksum = 0
+    src = socket.inet_aton(src_ip)
+    dest = socket.inet_aton(dest_ip)
+
+    header = struct.pack('!B B H H H B B H 4s 4s',
+                         version_ihl, 0, total_length, identification,
+                         flags_fragment, ttl, protocol, header_checksum,
+                         src, dest)
+    return header
+
+
+def build_tcp(src_port, dest_port, flags_dict, payload=b'', seq=None, ack=None):
+    """Build TCP header."""
+    seq = seq or random.randint(100000, 999999)
+    ack_num = ack or 0
+    offset = 5
+    flags = 0
+    if flags_dict.get('FIN'): flags |= 0x01
+    if flags_dict.get('SYN'): flags |= 0x02
+    if flags_dict.get('RST'): flags |= 0x04
+    if flags_dict.get('PSH'): flags |= 0x08
+    if flags_dict.get('ACK'): flags |= 0x10
+    if flags_dict.get('URG'): flags |= 0x20
+
+    offset_flags = (offset << 12) | flags
+    window = 65535
+    checksum = 0
+    urgent = 0
+
+    header = struct.pack('!H H L L H H H H',
+                         src_port, dest_port, seq, ack_num,
+                         offset_flags, window, checksum, urgent)
+    return header + payload
+
+
+def build_udp(src_port, dest_port, payload=b''):
+    """Build UDP header."""
+    length = 8 + len(payload)
+    checksum = 0
+    header = struct.pack('!H H H H', src_port, dest_port, length, checksum)
+    return header + payload
+
+
+def build_icmp(icmp_type=8, code=0, payload=b''):
+    """Build ICMP header."""
+    checksum = 0
+    header = struct.pack('!B B H', icmp_type, code, checksum)
+    return header + payload
+
+
+def build_arp(opcode, sender_mac, sender_ip, target_mac, target_ip):
+    """Build ARP packet."""
+    hw_type = 1
+    proto_type = 0x0800
+    hw_size = 6
+    proto_size = 4
+    header = struct.pack('!H H B B H',
+                         hw_type, proto_type, hw_size, proto_size, opcode)
+    header += bytes.fromhex(sender_mac.replace(':', ''))
+    header += socket.inet_aton(sender_ip)
+    header += bytes.fromhex(target_mac.replace(':', ''))
+    header += socket.inet_aton(target_ip)
+    return header
+
+
+def build_dns_query(txn_id=None):
+    """Build minimal DNS query header."""
+    txn_id = txn_id or random.randint(1, 65535)
+    flags = 0x0100  # Standard query
+    return struct.pack('!H H H H H H', txn_id, flags, 1, 0, 0, 0) + b'\x00' * 10
+
+
+def generate_demo_packets():
+    """Generate a full set of demo packets simulating realistic attack traffic."""
+    packets = []
+
+    attacker_ip = '192.168.1.100'
+    attacker_mac = 'aa:bb:cc:dd:ee:01'
+    server_ip = '10.0.0.50'
+    server_mac = '11:22:33:44:55:66'
+    gateway_ip = '192.168.1.1'
+    gateway_mac = 'ff:ee:dd:cc:bb:aa'
+    internal_ip = '192.168.1.25'
+    internal_mac = 'aa:bb:cc:dd:ee:02'
+    dns_server = '8.8.8.8'
+
+    # === 1. Normal HTTP traffic (baseline) ===
+    for i in range(5):
+        sport = random.randint(49152, 65535)
+        tcp_payload = build_tcp(sport, 80, {'SYN': True})
+        ip_payload = build_ipv4(internal_ip, server_ip, 6, len(tcp_payload))
+        eth = build_ethernet(internal_mac, server_mac)
+        packets.append(eth + ip_payload + tcp_payload)
+
+    # === 2. Normal HTTPS traffic ===
+    for i in range(5):
+        sport = random.randint(49152, 65535)
+        tcp_payload = build_tcp(sport, 443, {'SYN': True, 'ACK': True})
+        ip_payload = build_ipv4(internal_ip, server_ip, 6, len(tcp_payload))
+        eth = build_ethernet(internal_mac, server_mac)
+        packets.append(eth + ip_payload + tcp_payload)
+
+    # === 3. Normal DNS queries ===
+    for i in range(5):
+        dns_payload = build_dns_query()
+        udp_payload = build_udp(random.randint(49152, 65535), 53, dns_payload)
+        ip_payload = build_ipv4(internal_ip, dns_server, 17, len(udp_payload))
+        eth = build_ethernet(internal_mac, gateway_mac)
+        packets.append(eth + ip_payload + udp_payload)
+
+    # === 4. PORT SCAN - SYN scan on 15 ports ===
+    scan_ports = [21, 22, 23, 25, 53, 80, 110, 135, 139, 443, 445, 993, 3306, 3389, 8080]
+    for port in scan_ports:
+        tcp_payload = build_tcp(random.randint(49152, 65535), port, {'SYN': True})
+        ip_payload = build_ipv4(attacker_ip, server_ip, 6, len(tcp_payload))
+        eth = build_ethernet(attacker_mac, server_mac)
+        packets.append(eth + ip_payload + tcp_payload)
+
+    # === 5. BRUTE FORCE - 8 SSH attempts ===
+    for i in range(8):
+        tcp_payload = build_tcp(random.randint(49152, 65535), 22, {'SYN': True})
+        ip_payload = build_ipv4(attacker_ip, server_ip, 6, len(tcp_payload))
+        eth = build_ethernet(attacker_mac, server_mac)
+        packets.append(eth + ip_payload + tcp_payload)
+
+    # === 6. BRUTE FORCE - 6 RDP attempts ===
+    for i in range(6):
+        tcp_payload = build_tcp(random.randint(49152, 65535), 3389, {'SYN': True})
+        ip_payload = build_ipv4(attacker_ip, server_ip, 6, len(tcp_payload))
+        eth = build_ethernet(attacker_mac, server_mac)
+        packets.append(eth + ip_payload + tcp_payload)
+
+    # === 7. ARP SPOOFING - Attacker impersonates gateway ===
+    # Normal ARP from real gateway
+    arp_normal = build_arp(2, gateway_mac, gateway_ip, 'ff:ff:ff:ff:ff:ff', '0.0.0.0')
+    eth = build_ethernet(gateway_mac, 'ff:ff:ff:ff:ff:ff', 0x0806)
+    packets.append(eth + arp_normal)
+
+    # Spoofed ARP from attacker claiming to be gateway
+    arp_spoof = build_arp(2, attacker_mac, gateway_ip, 'ff:ff:ff:ff:ff:ff', '0.0.0.0')
+    eth = build_ethernet(attacker_mac, 'ff:ff:ff:ff:ff:ff', 0x0806)
+    packets.append(eth + arp_spoof)
+
+    # === 8. DNS TUNNELING - 20 rapid DNS queries ===
+    for i in range(20):
+        dns_payload = build_dns_query()
+        udp_payload = build_udp(random.randint(49152, 65535), 53, dns_payload)
+        ip_payload = build_ipv4(attacker_ip, dns_server, 17, len(udp_payload))
+        eth = build_ethernet(attacker_mac, gateway_mac)
+        packets.append(eth + ip_payload + udp_payload)
+
+    # === 9. ICMP FLOOD - 25 pings ===
+    for i in range(25):
+        icmp_payload = build_icmp(8, 0, b'\x00' * 56)
+        ip_payload = build_ipv4(attacker_ip, server_ip, 1, len(icmp_payload))
+        eth = build_ethernet(attacker_mac, server_mac)
+        packets.append(eth + ip_payload + icmp_payload)
+
+    # === 10. SUSPICIOUS PORTS - Metasploit + IRC ===
+    # Metasploit reverse shell on 4444
+    tcp_payload = build_tcp(4444, random.randint(49152, 65535), {'PSH': True, 'ACK': True}, b'\x00' * 100)
+    ip_payload = build_ipv4(server_ip, attacker_ip, 6, len(tcp_payload))
+    eth = build_ethernet(server_mac, attacker_mac)
+    packets.append(eth + ip_payload + tcp_payload)
+
+    # IRC C2 channel on 6667
+    tcp_payload = build_tcp(random.randint(49152, 65535), 6667, {'SYN': True})
+    ip_payload = build_ipv4(attacker_ip, '203.0.113.50', 6, len(tcp_payload))
+    eth = build_ethernet(attacker_mac, gateway_mac)
+    packets.append(eth + ip_payload + tcp_payload)
+
+    # Back Orifice on 31337
+    tcp_payload = build_tcp(random.randint(49152, 65535), 31337, {'SYN': True})
+    ip_payload = build_ipv4(attacker_ip, server_ip, 6, len(tcp_payload))
+    eth = build_ethernet(attacker_mac, server_mac)
+    packets.append(eth + ip_payload + tcp_payload)
+
+    # === 11. INSECURE SERVICES - Telnet + FTP ===
+    for port in [23, 21]:
+        tcp_payload = build_tcp(random.randint(49152, 65535), port, {'SYN': True, 'ACK': True})
+        ip_payload = build_ipv4(internal_ip, server_ip, 6, len(tcp_payload))
+        eth = build_ethernet(internal_mac, server_mac)
+        packets.append(eth + ip_payload + tcp_payload)
+
+    # === 12. Normal ICMP (ping) ===
+    for i in range(3):
+        icmp_payload = build_icmp(8, 0, b'\x00' * 32)
+        ip_payload = build_ipv4(internal_ip, server_ip, 1, len(icmp_payload))
+        eth = build_ethernet(internal_mac, server_mac)
+        packets.append(eth + ip_payload + icmp_payload)
+
+    # === 13. DATA EXFILTRATION - Large outbound transfer ===
+    chunk_size = 1400
+    total_chunks = 800  # ~1.1 MB
+    for i in range(total_chunks):
+        payload = b'\x41' * chunk_size
+        tcp_payload = build_tcp(random.randint(49152, 65535), 443, {'PSH': True, 'ACK': True}, payload)
+        ip_payload = build_ipv4(attacker_ip, '203.0.113.100', 6, len(tcp_payload))
+        eth = build_ethernet(attacker_mac, gateway_mac)
+        packets.append(eth + ip_payload + tcp_payload)
+
+    return packets
+
+LNPS_EOF_DEMO_TRAFFIC_PY
+
+echo "[*] Creating report_generator.py..."
+cat > report_generator.py << 'LNPS_EOF_REPORT_GENERATOR_PY'
+"""
+LNPS - Report Generator
+Produces HTML and JSON reports from captured packets and security alerts.
+"""
+
+import json
+import time
+from collections import defaultdict
+
+
+class ReportGenerator:
+    """Generate professional security analysis reports."""
+
+    def __init__(self, packets, alerts, stats, alert_summary):
+        self.packets = packets
+        self.alerts = alerts
+        self.stats = stats
+        self.alert_summary = alert_summary
+
+    def generate_json(self, output_path='lnps_report.json'):
+        """Generate JSON report."""
+        report = {
+            'report_metadata': {
+                'tool': 'LNPS - Linux Network Packet Sniffer',
+                'generated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'version': '1.0.0',
+            },
+            'capture_statistics': self.stats,
+            'alert_summary': self.alert_summary,
+            'alerts': self.alerts,
+            'protocol_breakdown': self._get_protocol_breakdown(),
+            'top_talkers': self._get_top_talkers(),
+            'service_map': self._get_service_map(),
+        }
+
+        with open(output_path, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+
+        return output_path
+
+    def generate_html(self, output_path='lnps_report.html'):
+        """Generate HTML report."""
+        severity_colors = {
+            'CRITICAL': '#dc2626',
+            'HIGH': '#ea580c',
+            'MEDIUM': '#d97706',
+            'LOW': '#2563eb',
+            'INFO': '#6b7280',
+        }
+
+        protocol_breakdown = self._get_protocol_breakdown()
+        top_talkers = self._get_top_talkers()
+        service_map = self._get_service_map()
+
+        # Build alert rows
+        alert_rows = ''
+        for a in sorted(self.alerts, key=lambda x: x['score'], reverse=True):
+            color = severity_colors.get(a['severity'], '#6b7280')
+            mitre = f"{a['mitre_technique']} - {a['mitre_name']}" if a['mitre_technique'] else 'N/A'
+            alert_rows += f"""
+            <tr>
+                <td><span style="background:{color};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;">{a['severity']}</span></td>
+                <td>{a['category']}</td>
+                <td>{a['title']}</td>
+                <td>{a['src_ip']}</td>
+                <td>{a['dest_ip']}</td>
+                <td><code>{mitre}</code></td>
+                <td>{a['score']}</td>
+            </tr>"""
+
+        # Build protocol rows
+        proto_rows = ''
+        for proto, count in sorted(protocol_breakdown.items(), key=lambda x: x[1], reverse=True):
+            pct = round(count / max(self.stats.get('total', 1), 1) * 100, 1)
+            proto_rows += f"<tr><td>{proto}</td><td>{count}</td><td>{pct}%</td></tr>"
+
+        # Build top talker rows
+        talker_rows = ''
+        for ip, count in top_talkers[:10]:
+            talker_rows += f"<tr><td>{ip}</td><td>{count}</td></tr>"
+
+        # Build service rows
+        service_rows = ''
+        for svc, count in sorted(service_map.items(), key=lambda x: x[1], reverse=True):
+            service_rows += f"<tr><td>{svc}</td><td>{count}</td></tr>"
+
+        # MITRE rows
+        mitre_rows = ''
+        for tid, tname in self.alert_summary.get('mitre_techniques', []):
+            mitre_rows += f"<tr><td><code>{tid}</code></td><td>{tname}</td></tr>"
+
+        # Severity summary
+        sev_counts = self.alert_summary.get('severity_counts', {})
+        risk_score = self.alert_summary.get('total_risk_score', 0)
+
+        if risk_score >= 500:
+            risk_color = '#dc2626'
+            risk_label = 'CRITICAL'
+        elif risk_score >= 300:
+            risk_color = '#ea580c'
+            risk_label = 'HIGH'
+        elif risk_score >= 150:
+            risk_color = '#d97706'
+            risk_label = 'MEDIUM'
+        else:
+            risk_color = '#16a34a'
+            risk_label = 'LOW'
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>LNPS Security Report</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: 'Segoe UI', Tahoma, sans-serif; background: #0f172a; color: #e2e8f0; padding: 20px; }}
+        .container {{ max-width: 1200px; margin: 0 auto; }}
+        h1 {{ color: #38bdf8; font-size: 28px; margin-bottom: 5px; }}
+        h2 {{ color: #38bdf8; font-size: 20px; margin: 30px 0 15px; border-bottom: 1px solid #334155; padding-bottom: 8px; }}
+        .subtitle {{ color: #94a3b8; font-size: 14px; margin-bottom: 25px; }}
+        .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }}
+        .stat-card {{ background: #1e293b; border-radius: 8px; padding: 18px; text-align: center; border: 1px solid #334155; }}
+        .stat-value {{ font-size: 32px; font-weight: bold; color: #38bdf8; }}
+        .stat-label {{ color: #94a3b8; font-size: 13px; margin-top: 5px; }}
+        .risk-badge {{ display: inline-block; padding: 8px 20px; border-radius: 6px; font-weight: bold; font-size: 18px; color: #fff; }}
+        table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
+        th {{ background: #1e293b; color: #38bdf8; padding: 10px 12px; text-align: left; font-size: 13px; text-transform: uppercase; }}
+        td {{ padding: 10px 12px; border-bottom: 1px solid #1e293b; font-size: 14px; }}
+        tr:hover {{ background: #1e293b; }}
+        code {{ background: #334155; padding: 2px 6px; border-radius: 3px; font-size: 13px; }}
+        .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
+        .three-col {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }}
+        .section {{ background: #1e293b; border-radius: 8px; padding: 20px; border: 1px solid #334155; }}
+        .footer {{ text-align: center; color: #64748b; margin-top: 40px; font-size: 12px; padding: 20px; }}
+        @media (max-width: 768px) {{
+            .two-col, .three-col {{ grid-template-columns: 1fr; }}
+        }}
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>LNPS Security Report</h1>
+    <p class="subtitle">Linux Network Packet Sniffer &mdash; Generated {time.strftime('%Y-%m-%d %H:%M:%S')}</p>
+
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-value">{self.stats.get('total', 0)}</div>
+            <div class="stat-label">Packets Captured</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{self.alert_summary.get('total_alerts', 0)}</div>
+            <div class="stat-label">Security Alerts</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color:{risk_color}">{risk_score}</div>
+            <div class="stat-label">Risk Score</div>
+        </div>
+        <div class="stat-card">
+            <div class="risk-badge" style="background:{risk_color}">{risk_label}</div>
+            <div class="stat-label">Threat Level</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{len(self.alert_summary.get('mitre_techniques', []))}</div>
+            <div class="stat-label">MITRE Techniques</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{self.stats.get('bytes_captured', 0):,}</div>
+            <div class="stat-label">Bytes Captured</div>
+        </div>
+    </div>
+
+    <h2>Security Alerts</h2>
+    <table>
+        <thead><tr>
+            <th>Severity</th><th>Category</th><th>Title</th>
+            <th>Source IP</th><th>Dest IP</th><th>MITRE ATT&CK</th><th>Score</th>
+        </tr></thead>
+        <tbody>{alert_rows}</tbody>
+    </table>
+
+    <div class="three-col">
+        <div class="section">
+            <h2 style="margin-top:0;">Protocol Breakdown</h2>
+            <table>
+                <thead><tr><th>Protocol</th><th>Count</th><th>%</th></tr></thead>
+                <tbody>{proto_rows}</tbody>
+            </table>
+        </div>
+        <div class="section">
+            <h2 style="margin-top:0;">Top Talkers</h2>
+            <table>
+                <thead><tr><th>IP Address</th><th>Packets</th></tr></thead>
+                <tbody>{talker_rows}</tbody>
+            </table>
+        </div>
+        <div class="section">
+            <h2 style="margin-top:0;">Services Detected</h2>
+            <table>
+                <thead><tr><th>Service</th><th>Connections</th></tr></thead>
+                <tbody>{service_rows}</tbody>
+            </table>
+        </div>
+    </div>
+
+    <h2>MITRE ATT&CK Coverage</h2>
+    <div class="section">
+        <table>
+            <thead><tr><th>Technique ID</th><th>Technique Name</th></tr></thead>
+            <tbody>{mitre_rows}</tbody>
+        </table>
+    </div>
+
+    <h2>Severity Distribution</h2>
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-value" style="color:#dc2626">{sev_counts.get('CRITICAL', 0)}</div>
+            <div class="stat-label">Critical</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color:#ea580c">{sev_counts.get('HIGH', 0)}</div>
+            <div class="stat-label">High</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color:#d97706">{sev_counts.get('MEDIUM', 0)}</div>
+            <div class="stat-label">Medium</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" style="color:#2563eb">{sev_counts.get('LOW', 0)}</div>
+            <div class="stat-label">Low</div>
+        </div>
+    </div>
+
+    <div class="footer">
+        LNPS v1.0.0 &mdash; Linux Network Packet Sniffer &mdash; Larry Odeyemi
+    </div>
+</div>
+</body>
+</html>"""
+
+        with open(output_path, 'w') as f:
+            f.write(html)
+
+        return output_path
+
+    def _get_protocol_breakdown(self):
+        """Count packets by protocol."""
+        breakdown = defaultdict(int)
+        for pkt in self.packets:
+            layers = pkt.get('layers', {})
+            if 'tcp' in layers:
+                breakdown['TCP'] += 1
+            elif 'udp' in layers:
+                breakdown['UDP'] += 1
+            elif 'icmp' in layers:
+                breakdown['ICMP'] += 1
+            elif 'arp' in layers:
+                breakdown['ARP'] += 1
+            else:
+                breakdown['Other'] += 1
+        return dict(breakdown)
+
+    def _get_top_talkers(self):
+        """Identify IPs generating most traffic."""
+        talkers = defaultdict(int)
+        for pkt in self.packets:
+            ipv4 = pkt.get('layers', {}).get('ipv4', {})
+            src = ipv4.get('src_ip')
+            if src:
+                talkers[src] += 1
+        return sorted(talkers.items(), key=lambda x: x[1], reverse=True)
+
+    def _get_service_map(self):
+        """Map detected services and their connection counts."""
+        services = defaultdict(int)
+        for pkt in self.packets:
+            layers = pkt.get('layers', {})
+            for proto in ['tcp', 'udp']:
+                if proto in layers and layers[proto].get('service'):
+                    services[layers[proto]['service']] += 1
+        return dict(services)
+
+LNPS_EOF_REPORT_GENERATOR_PY
+
+echo "[*] Creating run_sniffer.py..."
+cat > run_sniffer.py << 'LNPS_EOF_RUN_SNIFFER_PY'
+#!/usr/bin/env python3
+"""
+LNPS - Linux Network Packet Sniffer
+Main entry point. Supports live capture (requires root) and demo mode.
+
+Usage:
+    sudo python3 run_sniffer.py --live [-i eth0] [-c 100]
+    python3 run_sniffer.py --demo
+"""
+
+import argparse
+import sys
+import time
+from packet_sniffer import PacketSniffer
+from alert_engine import AlertEngine
+from report_generator import ReportGenerator
+from demo_traffic import generate_demo_packets
+
+
+BANNER = r"""
+  _     _   _ ____  ____
+ | |   | \ | |  _ \/ ___|
+ | |   |  \| | |_) \___ \
+ | |___| |\  |  __/ ___) |
+ |_____|_| \_|_|   |____/
+
+ Linux Network Packet Sniffer v1.0.0
+ Author: Larry Odeyemi
+ ─────────────────────────────────────
+"""
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='LNPS - Linux Network Packet Sniffer',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  sudo python3 run_sniffer.py --live              # Capture on all interfaces
+  sudo python3 run_sniffer.py --live -i eth0       # Capture on eth0 only
+  sudo python3 run_sniffer.py --live -c 200        # Capture 200 packets
+  python3 run_sniffer.py --demo                    # Run with simulated traffic
+        """
+    )
+
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--live', action='store_true', help='Live packet capture (requires root/sudo)')
+    mode.add_argument('--demo', action='store_true', help='Demo mode with simulated attack traffic')
+
+    parser.add_argument('-i', '--interface', default=None, help='Network interface to sniff (default: all)')
+    parser.add_argument('-c', '--count', type=int, default=0, help='Max packets to capture (0 = unlimited)')
+    parser.add_argument('-o', '--output', default='lnps_report', help='Output report filename (without extension)')
+    parser.add_argument('--json-only', action='store_true', help='Generate JSON report only')
+    parser.add_argument('--html-only', action='store_true', help='Generate HTML report only')
+
+    args = parser.parse_args()
+
+    print(BANNER)
+
+    # Initialize sniffer
+    sniffer = PacketSniffer(
+        interface=args.interface,
+        max_packets=args.count,
+    )
+
+    # Capture packets
+    if args.live:
+        print("[*] Mode: LIVE CAPTURE")
+        print(f"[*] Interface: {args.interface or 'all'}")
+        print(f"[*] Max packets: {args.count or 'unlimited'}")
+        print("=" * 50)
+        packets = sniffer.start_live_capture()
+    else:
+        print("[*] Mode: DEMO (simulated attack traffic)")
+        print("[*] Generating realistic network packets...")
+        print("=" * 50)
+        demo_packets = generate_demo_packets()
+        packets = sniffer.process_demo_traffic(demo_packets)
+
+    if not packets:
+        print("[!] No packets captured. Exiting.")
+        sys.exit(1)
+
+    stats = sniffer.get_stats()
+
+    print(f"\n{'=' * 50}")
+    print(f"[*] Capture Complete")
+    print(f"    Packets: {stats['total']}")
+    print(f"    TCP: {stats['tcp']}  |  UDP: {stats['udp']}  |  ICMP: {stats['icmp']}  |  ARP: {stats['arp']}")
+    print(f"    DNS: {stats['dns']}  |  Other: {stats['other']}")
+    print(f"    Bytes: {stats['bytes_captured']:,}")
+    print(f"    Duration: {stats['duration']}s  |  Rate: {stats['pps']} pkt/s")
+
+    # Run security analysis
+    print(f"\n{'=' * 50}")
+    print("[*] Running Security Analysis...")
+    engine = AlertEngine()
+    alerts = engine.analyze(packets)
+    alert_summary = engine.get_summary()
+
+    print(f"    Alerts: {alert_summary['total_alerts']}")
+    print(f"    Risk Score: {alert_summary['total_risk_score']}")
+    print(f"    MITRE Techniques: {len(alert_summary['mitre_techniques'])}")
+
+    # Print severity breakdown
+    sev = alert_summary.get('severity_counts', {})
+    print(f"    CRITICAL: {sev.get('CRITICAL', 0)}  |  HIGH: {sev.get('HIGH', 0)}  |  MEDIUM: {sev.get('MEDIUM', 0)}  |  LOW: {sev.get('LOW', 0)}")
+
+    # Print alerts
+    if alerts:
+        print(f"\n{'=' * 50}")
+        print("[*] Security Alerts:")
+        print(f"{'─' * 90}")
+        for a in sorted(alerts, key=lambda x: x['score'], reverse=True):
+            mitre = f" [{a['mitre_technique']}]" if a['mitre_technique'] else ''
+            print(f"  [{a['severity']:8s}] {a['title']}{mitre}")
+            print(f"           {a['description'][:100]}")
+            print(f"{'─' * 90}")
+
+    # Generate reports
+    print(f"\n{'=' * 50}")
+    print("[*] Generating Reports...")
+
+    report_gen = ReportGenerator(packets, alerts, stats, alert_summary)
+
+    if not args.json_only:
+        html_path = report_gen.generate_html(f"{args.output}.html")
+        print(f"    HTML Report: {html_path}")
+
+    if not args.html_only:
+        json_path = report_gen.generate_json(f"{args.output}.json")
+        print(f"    JSON Report: {json_path}")
+
+    print(f"\n{'=' * 50}")
+    print("[*] LNPS analysis complete.")
+    print(f"    Open {args.output}.html in a browser for the full report.")
+
+
+if __name__ == '__main__':
+    main()
+
+LNPS_EOF_RUN_SNIFFER_PY
+
+echo "[*] Creating .gitignore..."
+cat > .gitignore << 'LNPS_EOF_GITIGNORE'
+__pycache__/
+*.pyc
+*.pyo
+*.json
+*.html
+.DS_Store
+*.egg-info/
+dist/
+build/
+.env
+venv/
+
+LNPS_EOF_GITIGNORE
+
+echo "[*] Creating LICENSE..."
+cat > LICENSE << 'LNPS_EOF_LICENSE'
+MIT License
+
+Copyright (c) 2026 Larry Odeyemi
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+LNPS_EOF_LICENSE
+
+echo ""
+echo "=========================================="
+echo "[*] LNPS setup complete!"
+echo "[*] Files created:"
+echo "    - run_sniffer.py (main entry point)"
+echo "    - packet_sniffer.py (capture engine)"
+echo "    - protocol_parser.py (protocol decoder)"
+echo "    - alert_engine.py (security detection)"
+echo "    - demo_traffic.py (simulated traffic)"
+echo "    - report_generator.py (HTML/JSON reports)"
+echo "    - .gitignore"
+echo "    - LICENSE"
+echo ""
+echo "[*] Test with: python run_sniffer.py --demo"
+echo "=========================================="
